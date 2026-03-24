@@ -4,9 +4,13 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.nn.utils import clip_grad_norm_
 from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.preprocessing import MinMaxScaler
 import matplotlib.pyplot as plt
 from io import StringIO
+import copy
+from pathlib import Path
 
 # ==============================
 # Utility Functions
@@ -23,24 +27,128 @@ def realized_volatility(returns, window):
     return returns.rolling(window).std() * np.sqrt(252)
 
 def create_sequences(data, seq_length):
+    """Create sequences from data. Handles both 1D and 2D arrays.
+    For 2D input (samples, features): X is (num_seq, seq_length, features), y is (num_seq,) using first column as target.
+    For 1D input: X is (num_seq, seq_length), y is (num_seq,).
+    """
     xs, ys = [], []
-    for i in range(len(data) - seq_length):
-        xs.append(data[i:i+seq_length])
-        ys.append(data[i+seq_length])
+    if data.ndim == 1:
+        for i in range(len(data) - seq_length):
+            xs.append(data[i:i+seq_length])
+            ys.append(data[i+seq_length])
+    else:
+        for i in range(len(data) - seq_length):
+            xs.append(data[i:i+seq_length, :])  # all features for the window
+            ys.append(data[i+seq_length, 0])     # target is first column (realized_vol)
     return np.array(xs), np.array(ys)
 
 # ==============================
 # PyTorch LSTM Model
 # ==============================
 class LSTMVolModel(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers):
+    def __init__(self, input_size, hidden_size, num_layers, dropout=0.0):
         super().__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
+        # dropout between LSTM layers (only active when num_layers > 1)
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers,
+                            batch_first=True,
+                            dropout=dropout if num_layers > 1 else 0.0)
+        self.dropout = nn.Dropout(p=dropout)
         self.fc = nn.Linear(hidden_size, 1)
+
     def forward(self, x):
         out, _ = self.lstm(x)
         out = out[:, -1, :]
+        out = self.dropout(out)
         return self.fc(out)
+
+# ==============================
+# Walk-Forward Cross-Validation
+# ==============================
+def walk_forward_cv(features_scaled, target_scaler, seq_length, hidden_size,
+                    num_layers, epochs, lr, device, n_folds=5):
+    """Walk-forward CV with expanding training window and 5 temporal folds.
+    Returns list of per-fold RMSE values (in original scale).
+    """
+    n = len(features_scaled)
+    fold_size = (n - seq_length) // n_folds
+    rmse_scores = []
+
+    for fold in range(n_folds):
+        # Expanding training window: start from 0 up to fold boundary
+        train_end = seq_length + fold_size * (fold + 1)
+        val_end = min(train_end + fold_size, n)
+        if train_end >= n or val_end <= train_end + seq_length:
+            break
+
+        train_data = features_scaled[:train_end]
+        val_data = features_scaled[train_end - seq_length:val_end]  # overlap for sequence context
+
+        X_tr, y_tr = create_sequences(train_data, seq_length)
+        X_vl, y_vl = create_sequences(val_data, seq_length)
+
+        if len(X_tr) == 0 or len(X_vl) == 0:
+            continue
+
+        y_tr = y_tr[..., np.newaxis]
+        y_vl = y_vl[..., np.newaxis]
+
+        X_tr_t = torch.tensor(X_tr, dtype=torch.float32).to(device)
+        y_tr_t = torch.tensor(y_tr, dtype=torch.float32).to(device)
+        X_vl_t = torch.tensor(X_vl, dtype=torch.float32).to(device)
+        y_vl_t = torch.tensor(y_vl, dtype=torch.float32).to(device)
+
+        model = LSTMVolModel(input_size=3, hidden_size=hidden_size,
+                             num_layers=num_layers, dropout=0.2).to(device)
+        criterion = nn.MSELoss()
+        optimizer = optim.Adam(model.parameters(), lr=lr)
+
+        best_val_loss = float('inf')
+        best_state = None
+        patience_counter = 0
+
+        for epoch in range(epochs):
+            model.train()
+            optimizer.zero_grad()
+            output = model(X_tr_t)
+            loss = criterion(output, y_tr_t)
+            loss.backward()
+            clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+
+            model.eval()
+            with torch.no_grad():
+                vp = model(X_vl_t)
+                vl = criterion(vp, y_vl_t).item()
+            if vl < best_val_loss:
+                best_val_loss = vl
+                best_state = copy.deepcopy(model.state_dict())
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= 20:
+                    break
+
+        if best_state is not None:
+            model.load_state_dict(best_state)
+
+        model.eval()
+        with torch.no_grad():
+            preds_scaled = model(X_vl_t).cpu().numpy().flatten()
+            actuals_scaled = y_vl.flatten()
+
+        # Inverse-transform (target is first column of feature scaler)
+        dummy_pred = np.zeros((len(preds_scaled), 3))
+        dummy_pred[:, 0] = preds_scaled
+        preds_orig = target_scaler.inverse_transform(dummy_pred)[:, 0]
+
+        dummy_act = np.zeros((len(actuals_scaled), 3))
+        dummy_act[:, 0] = actuals_scaled
+        actuals_orig = target_scaler.inverse_transform(dummy_act)[:, 0]
+
+        fold_rmse = np.sqrt(mean_squared_error(actuals_orig, preds_orig))
+        rmse_scores.append(fold_rmse)
+
+    return rmse_scores
 
 # ==============================
 # Streamlit App
@@ -57,6 +165,8 @@ with st.sidebar:
     lr = st.number_input("Learning Rate", 0.0001, 0.1, 0.001, format="%f")
     st.markdown("---")
     data_source = st.radio("Data Source", ["Upload CSV", "Synthetic GBM"], horizontal=True)
+    st.markdown("---")
+    run_wfcv = st.button("Run Walk-Forward Validation")
 
 # ==============================
 # Data Loading
@@ -78,16 +188,29 @@ else:
     df = generate_gbm(n_days=n_days)
 
 # ==============================
-# Feature Engineering
+# Feature Engineering (1C: 3 features)
 # ==============================
 df['log_return'] = np.log(df['close']).diff()
 df['realized_vol'] = realized_volatility(df['log_return'], window=seq_length)
+df['momentum_5'] = df['log_return'].rolling(5).mean()
 df = df.dropna().reset_index(drop=True)
 
-# Prepare sequences
-data_vol = df['realized_vol'].values.astype(np.float32)
-X, y = create_sequences(data_vol, seq_length)
-X = X[..., np.newaxis]  # shape: (samples, seq_length, 1)
+# Build multi-feature array: [realized_vol, log_return, momentum_5]
+feature_cols = ['realized_vol', 'log_return', 'momentum_5']
+features_raw = df[feature_cols].values.astype(np.float32)  # shape: (N, 3)
+
+# ==============================
+# 1A/1C: MinMaxScaler normalization BEFORE sequence creation
+# ==============================
+# We fit the scaler on training portion only (first 80%)
+split_raw = int(0.8 * len(features_raw))
+feature_scaler = MinMaxScaler(feature_range=(0, 1))
+feature_scaler.fit(features_raw[:split_raw])
+features_scaled = feature_scaler.transform(features_raw)
+
+# Create sequences from scaled multi-feature data
+X, y = create_sequences(features_scaled, seq_length)
+# X shape: (samples, seq_length, 3), y shape: (samples,) — target is realized_vol (col 0)
 y = y[..., np.newaxis]  # shape: (samples, 1)
 
 # Train/val split
@@ -97,18 +220,23 @@ y_train, y_val = y[:split], y[split:]
 
 # Torch tensors
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-X_train_t = torch.tensor(X_train).to(device)
-y_train_t = torch.tensor(y_train).to(device)
-X_val_t = torch.tensor(X_val).to(device)
-y_val_t = torch.tensor(y_val).to(device)
+X_train_t = torch.tensor(X_train, dtype=torch.float32).to(device)
+y_train_t = torch.tensor(y_train, dtype=torch.float32).to(device)
+X_val_t = torch.tensor(X_val, dtype=torch.float32).to(device)
+y_val_t = torch.tensor(y_val, dtype=torch.float32).to(device)
 
 # ==============================
-# Model Training
+# Model Training (1B: early stopping, 1D: dropout + grad clipping)
 # ==============================
-model = LSTMVolModel(input_size=1, hidden_size=hidden_size, num_layers=num_layers).to(device)
+model = LSTMVolModel(input_size=3, hidden_size=hidden_size,
+                     num_layers=num_layers, dropout=0.2).to(device)
 criterion = nn.MSELoss()
 optimizer = optim.Adam(model.parameters(), lr=lr)
 train_losses, val_losses = [], []
+
+best_val_loss = float('inf')
+best_model_state = None
+patience_counter = 0
 
 for epoch in range(epochs):
     model.train()
@@ -116,8 +244,10 @@ for epoch in range(epochs):
     output = model(X_train_t)
     loss = criterion(output, y_train_t)
     loss.backward()
+    clip_grad_norm_(model.parameters(), max_norm=1.0)  # 1D: gradient clipping
     optimizer.step()
     train_losses.append(loss.item())
+
     # Validation
     model.eval()
     with torch.no_grad():
@@ -125,13 +255,44 @@ for epoch in range(epochs):
         val_loss = criterion(val_pred, y_val_t)
         val_losses.append(val_loss.item())
 
+    # 1B: Early stopping with patience=20
+    if val_loss.item() < best_val_loss:
+        best_val_loss = val_loss.item()
+        best_model_state = copy.deepcopy(model.state_dict())
+        patience_counter = 0
+    else:
+        patience_counter += 1
+        if patience_counter >= 20:
+            break
+
+# Load best model state
+if best_model_state is not None:
+    model.load_state_dict(best_model_state)
+
+# Save best model to models/lstm_vol_best.pt
+models_dir = Path(__file__).resolve().parent / "models"
+models_dir.mkdir(exist_ok=True)
+torch.save(model.state_dict(), models_dir / "lstm_vol_best.pt")
+
 # ==============================
-# Evaluation
+# Evaluation (1A: inverse-transform before metrics)
 # ==============================
 model.eval()
 with torch.no_grad():
-    y_pred = model(X_val_t).cpu().numpy().flatten()
-    y_true = y_val.flatten()
+    y_pred_scaled = model(X_val_t).cpu().numpy().flatten()
+    y_true_scaled = y_val.flatten()
+
+# Inverse-transform predictions and actuals back to original scale
+# realized_vol is column 0 of the feature scaler, so we build dummy arrays
+def inverse_transform_col0(values, scaler, n_features=3):
+    """Inverse-transform values that correspond to column 0 of the scaler."""
+    dummy = np.zeros((len(values), n_features))
+    dummy[:, 0] = values
+    return scaler.inverse_transform(dummy)[:, 0]
+
+y_pred = inverse_transform_col0(y_pred_scaled, feature_scaler)
+y_true = inverse_transform_col0(y_true_scaled, feature_scaler)
+
 rmse = np.sqrt(mean_squared_error(y_true, y_pred))
 r2 = r2_score(y_true, y_pred)
 errors = y_pred - y_true
@@ -181,5 +342,30 @@ with col2:
     st.metric("R-squared", f"{r2:.4f}")
     st.subheader("Error Distribution")
     plot_error_dist(errors)
+
+# ==============================
+# 1E: Walk-Forward Cross-Validation
+# ==============================
+if run_wfcv:
+    with st.spinner("Running walk-forward cross-validation (5 folds)..."):
+        rmse_scores = walk_forward_cv(
+            features_scaled=features_scaled,
+            target_scaler=feature_scaler,
+            seq_length=seq_length,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            epochs=epochs,
+            lr=lr,
+            device=device,
+            n_folds=5
+        )
+    if rmse_scores:
+        st.subheader("Walk-Forward Cross-Validation Results")
+        for i, score in enumerate(rmse_scores):
+            st.write(f"Fold {i+1} RMSE: {score:.4f}")
+        st.metric("Mean RMSE", f"{np.mean(rmse_scores):.4f}")
+        st.metric("Std RMSE", f"{np.std(rmse_scores):.4f}")
+    else:
+        st.warning("Not enough data to run walk-forward validation with current settings.")
 
 st.caption("© 2026 LSTM Volatility Forecasting Engine. Powered by PyTorch & Streamlit.")
